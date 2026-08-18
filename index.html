@@ -400,7 +400,7 @@
 
   <div class="cake-controls">
     <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
-    <div class="meter-label" id="meterLabel">mic listening…</div>
+    <div class="meter-label" id="meterLabel">getting ready…</div>
     <button class="blow-btn" id="blowBtn">Hold to blow (or press space)</button>
     <div class="mic-note" id="micNote">Blowing needs this page hosted over HTTPS — if your mic is blocked, use the button above instead.</div>
   </div>
@@ -523,15 +523,17 @@
   var cakePage = document.getElementById('cakePage');
 
   var lit = true;
-  var blowLevel = 0;        // 0-1 smoothed level, drives meter
+  var blowLevel = 0;        // 0-1 smoothed, gain-applied level that drives the meter AND the threshold check
   var blowHoldMs = 0;       // sustained-blow accumulator
-  var THRESHOLD = 0.16;     // level above which we count as "blowing"
-  var HOLD_NEEDED = 500;    // ms of sustained blow to extinguish
+  var MIC_GAIN = 7;         // raw mic RMS is usually small (~0.02-0.15) — amplify it into a usable 0-1 range
+  var THRESHOLD = 0.32;     // default; recalibrated per-device once mic starts (see calibrateNoiseFloor)
+  var HOLD_NEEDED = 400;    // ms of sustained blow to extinguish
   var lastFrameTime = performance.now();
 
   var micActive = false;
   var fallbackHolding = false;
   var analyser = null, dataArray = null, micStream = null;
+  var calibrating = false, calibrateSamples = [], calibrateEndAt = 0;
 
   function setMeter(level){
     var pct = Math.max(0, Math.min(1, level)) * 100;
@@ -547,21 +549,40 @@
       meterLabel.textContent = 'mic needs https — use the button below';
       return;
     }
-    navigator.mediaDevices.getUserMedia({audio:true, video:false})
+    // Ask for the rawest possible signal: browsers' noise suppression / auto-gain
+    // are specifically designed to filter out breath & wind noise, which is
+    // exactly what candle-blowing sounds like — so we explicitly turn them off.
+    var constraints = {
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      },
+      video: false
+    };
+    navigator.mediaDevices.getUserMedia(constraints)
+      .catch(function(){
+        // some browsers reject unsupported constraint combos — retry with plain audio:true
+        return navigator.mediaDevices.getUserMedia({audio:true, video:false});
+      })
       .then(function(stream){
         micStream = stream;
         var ctx = getCtx();
         var source = ctx.createMediaStreamSource(stream);
         analyser = ctx.createAnalyser();
         analyser.fftSize = 1024;
-        analyser.smoothingTimeConstant = 0.4;
+        analyser.smoothingTimeConstant = 0; // we do our own smoothing below
         dataArray = new Uint8Array(analyser.fftSize);
         source.connect(analyser);
         micActive = true;
-        meterLabel.textContent = 'mic listening… blow!';
+        meterLabel.textContent = 'calibrating…';
         micNote.classList.add('hidden');
+        // brief calibration window to learn this device/room's ambient noise floor
+        calibrating = true;
+        calibrateSamples = [];
+        calibrateEndAt = performance.now() + 600;
       })
-      .catch(function(err){
+      .catch(function(){
         meterLabel.textContent = 'mic blocked — use the button below';
       });
   }
@@ -636,27 +657,45 @@
     requestAnimationFrame(loop);
     if(!opened || !lit) { return; }
 
-    var raw = 0;
-    if(micActive){
-      raw = readMicLevel();
+    // calibration: learn ambient noise floor for the first ~600ms of mic use
+    if(calibrating){
+      var raw0 = readMicLevel();
+      calibrateSamples.push(raw0);
+      if(now >= calibrateEndAt){
+        calibrating = false;
+        // use a low percentile rather than the mean, so a stray loud moment
+        // (e.g. the person already blowing before calibration finished)
+        // doesn't drag the whole threshold up
+        var sorted = calibrateSamples.slice().sort(function(a,b){return a-b;});
+        var p30 = sorted[Math.floor(sorted.length*0.3)] || 0;
+        var floorLevel = p30 * MIC_GAIN;
+        THRESHOLD = Math.max(0.18, Math.min(0.55, floorLevel + 0.13));
+        meterLabel.textContent = 'mic listening… blow!';
+      }
+      return;
     }
+
+    var level = 0;
     if(fallbackHolding){
-      raw = Math.max(raw, Math.min(1, (blowLevel + dt*0.004)));
+      level = 1; // holding the button always counts as a full-strength blow
+    } else if(micActive){
+      level = Math.min(1, readMicLevel() * MIC_GAIN);
     }
 
     // smooth
-    blowLevel += (raw - blowLevel) * 0.35;
-    setMeter(blowLevel * (micActive ? 3.2 : 1.15));
+    blowLevel += (level - blowLevel) * 0.4;
+    setMeter(blowLevel);
 
-    var blowing = blowLevel > THRESHOLD || fallbackHolding;
+    var blowing = fallbackHolding || (micActive && blowLevel > THRESHOLD);
     if(blowing){
       blowHoldMs += dt;
       if(blowHoldMs >= HOLD_NEEDED){
         extinguish();
       }
     } else {
-      blowHoldMs = Math.max(0, blowHoldMs - dt*1.5);
+      blowHoldMs = Math.max(0, blowHoldMs - dt*1.1);
     }
+    window.__blowDebug = {level:blowLevel, threshold:THRESHOLD, holdMs:blowHoldMs};
   }
   requestAnimationFrame(loop);
 
